@@ -282,22 +282,15 @@ val_data_graph_idx_list = np.array(meta['val_data_graph_idx_list'])
 
 # For AR validation
 ##########################################
-# val_sampled_df = pd.read_pickle(os.path.join(data_dir, 'combined_res_tok_shf_val_df.pkl'))
-# val_sampled_df = val_sampled_df[
-#     val_sampled_df['has_emb']
-# ]
-# val_n_nodes = int(val_sampled_df['n_nodes'].max())
-# val_graph_emb_np = graph_emb_np
-# val_meta = meta
-# val_emb_graph_id_to_idx_dict = val_meta['emb_graph_id_to_idx_dict']
-
-val_sampled_df = pd.read_pickle('data/qaoa_n10w_012325_v7/test_run_df.pkl')
-val_graph_emb_np = np.load(
-    'data/qaoa_n10w_012325_v7/feather_emb_d500.npy'
-)
-val_meta = pd.read_pickle("data/qaoa_n10w_012325_v7/meta.pkl")
-val_emb_graph_id_to_idx_dict = val_meta['emb_graph_id_to_idx_dict']
+val_sampled_df = pd.read_pickle(os.path.join(data_dir, 'combined_res_tok_shf_val_df.pkl'))
+val_sampled_df = val_sampled_df[
+    val_sampled_df['has_emb']
+]
 val_n_nodes = int(val_sampled_df['n_nodes'].max())
+val_graph_emb_np = graph_emb_np
+val_meta = meta
+val_emb_graph_id_to_idx_dict = val_meta['emb_graph_id_to_idx_dict']
+
 ##########################################
 
 
