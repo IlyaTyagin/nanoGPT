@@ -118,6 +118,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     graph_emb_dim: int = 500 # default for FEATHER graph
+    token_meta: dict = None # metadata for constrained decoding
 
 class GPT(nn.Module):
 
@@ -154,6 +155,9 @@ class GPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
+        # Initialize token categorization for constrained decoding
+        self._init_token_categories()
+
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.
@@ -173,6 +177,59 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def _init_token_categories(self):
+        """Categorize tokens for constrained decoding."""
+        if self.config.token_meta is None:
+            # If no metadata provided, disable constrained decoding
+            self.constrained_decoding_enabled = False
+            self.constrained_decoding_available = False
+            return
+
+        self.constrained_decoding_enabled = True
+        self.constrained_decoding_available = True
+        itos = self.config.token_meta.get('itos', {})
+
+        # Categorize tokens
+        self.special_tokens = set()
+        self.edge_tokens = set()
+        self.float_tokens = set()
+        self.operator_tokens = set()
+
+        for idx, token in itos.items():
+            if isinstance(token, str):
+                self.special_tokens.add(idx)
+            elif isinstance(token, tuple):
+                self.edge_tokens.add(idx)
+            elif isinstance(token, (int, float)):
+                # Distinguish operators from coefficients
+                # Operators are integers, coefficients are floats
+                if isinstance(token, int) and not isinstance(token, bool):
+                    self.operator_tokens.add(idx)
+                else:
+                    self.float_tokens.add(idx)
+
+        # Store specific special token indices
+        stoi = self.config.token_meta.get('stoi', {})
+        self.bos_token = stoi.get('bos')
+        self.eos_token = stoi.get('eos')
+        self.new_layer_token = stoi.get('new_layer_p')
+        self.end_of_graph_token = stoi.get('end_of_graph')
+        self.pad_token = stoi.get('pad', 0)
+
+    def set_constrained_decoding(self, enabled):
+        """
+        Enable or disable constrained decoding at generation time.
+
+        Args:
+            enabled: Boolean to enable (True) or disable (False) constraints
+        """
+        if not self.constrained_decoding_available:
+            if enabled:
+                print("Warning: Constrained decoding requested but not available (no token metadata)")
+            return
+
+        self.constrained_decoding_enabled = enabled
 
     def forward(self, idx, graph_emb, targets=None, padding_mask=None, preserve_time_dim=False):
         device = idx.device 
@@ -326,6 +383,112 @@ class GPT(nn.Module):
         mfu = flops_achieved / flops_promised
         return mfu
 
+    def get_allowed_token_mask(self, idx):
+        """
+        Create a mask for constrained decoding based on circuit grammar.
+
+        Args:
+            idx: Current token sequence (batch_size, seq_len)
+
+        Returns:
+            mask: Boolean tensor (batch_size, vocab_size) where True means allowed
+        """
+        if not self.constrained_decoding_enabled:
+            # Return all True mask if constrained decoding is disabled
+            return torch.ones(idx.size(0), self.config.vocab_size, dtype=torch.bool, device=idx.device)
+
+        batch_size = idx.size(0)
+        mask = torch.zeros(batch_size, self.config.vocab_size, dtype=torch.bool, device=idx.device)
+
+        # Process each sequence in the batch
+        for b in range(batch_size):
+            seq = idx[b]
+
+            # Find the last non-pad token
+            non_pad_mask = seq != self.pad_token
+            if non_pad_mask.any():
+                last_token_idx = non_pad_mask.nonzero(as_tuple=False)[-1].item()
+                last_token = seq[last_token_idx].item()
+            else:
+                # Empty sequence, should not happen but handle gracefully
+                last_token = self.bos_token
+
+            # Determine allowed tokens based on last token and grammar state
+            allowed_indices = self._get_allowed_tokens_for_state(seq, last_token)
+
+            # Set mask for allowed tokens
+            mask[b, allowed_indices] = True
+
+        return mask
+
+    def _get_allowed_tokens_for_state(self, seq, last_token):
+        """
+        Determine allowed tokens based on the last token and sequence state.
+
+        Grammar:
+        1. After 'bos': edge tuple OR 'end_of_graph'
+        2. After edge tuple: edge weight (float)
+        3. After edge weight: edge tuple OR 'end_of_graph'
+        4. After 'end_of_graph': 'new_layer_p' OR 'eos'
+        5. After 'new_layer_p': operator index (integer)
+        6. After operator index: beta coefficient (float)
+        7. After beta coefficient: gamma coefficient (float)
+        8. After gamma coefficient: 'new_layer_p' OR 'eos'
+        """
+
+        # Check if we're in graph section or circuit section
+        end_of_graph_positions = (seq == self.end_of_graph_token).nonzero(as_tuple=False)
+        in_circuit_section = len(end_of_graph_positions) > 0
+
+        if not in_circuit_section:
+            # Graph section
+            if last_token == self.bos_token:
+                # After bos: edge tuple OR end_of_graph
+                return list(self.edge_tokens) + [self.end_of_graph_token]
+            elif last_token in self.edge_tokens:
+                # After edge tuple: edge weight (float)
+                return list(self.float_tokens)
+            elif last_token in self.float_tokens:
+                # After edge weight: edge tuple OR end_of_graph
+                return list(self.edge_tokens) + [self.end_of_graph_token]
+            else:
+                # Fallback: allow edges and end_of_graph
+                return list(self.edge_tokens) + [self.end_of_graph_token]
+        else:
+            # Circuit section (after end_of_graph)
+            # Find position after last end_of_graph
+            last_eog_pos = end_of_graph_positions[-1].item()
+            circuit_seq = seq[last_eog_pos + 1:]
+
+            # Remove padding from circuit sequence
+            circuit_seq = circuit_seq[circuit_seq != self.pad_token]
+
+            # Determine position in 4-token layer structure
+            circuit_len = len(circuit_seq)
+
+            if circuit_len == 0 or last_token == self.end_of_graph_token:
+                # Right after end_of_graph or at layer boundary: new_layer_p OR eos
+                return [self.new_layer_token, self.eos_token]
+
+            # Calculate position within current layer (0: new_layer_p, 1: op, 2: beta, 3: gamma)
+            position_in_layer = circuit_len % 4
+
+            if position_in_layer == 1:
+                # After new_layer_p: operator index
+                return list(self.operator_tokens)
+            elif position_in_layer == 2:
+                # After operator: beta coefficient (float)
+                return list(self.float_tokens)
+            elif position_in_layer == 3:
+                # After beta: gamma coefficient (float)
+                return list(self.float_tokens)
+            elif position_in_layer == 0:
+                # After gamma: new_layer_p OR eos
+                return [self.new_layer_token, self.eos_token]
+            else:
+                # Fallback
+                return [self.new_layer_token, self.eos_token]
+
     @torch.no_grad()
     def generate(self, idx, graph_emb, max_new_tokens, temperature=1.0, top_k=None):
         """
@@ -339,12 +502,15 @@ class GPT(nn.Module):
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond, graph_emb)
             # pluck the logits at the final step and scale by desired temperature
+            # pluck & temperature
             logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
+            if self.constrained_decoding_enabled:
+                constraint_mask = self.get_allowed_token_mask(idx)  # (B,V)
+                logits = logits.masked_fill(~constraint_mask, float('-inf'))
+            # now (optionally) top-k inside the allowed set
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
+                logits[logits < v[:, [-1]]] = float('-inf')
             probs = F.softmax(logits, dim=-1)
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
