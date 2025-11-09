@@ -186,6 +186,7 @@ class GPT(nn.Module):
         self.constrained_decoding_enabled = True
         self.constrained_decoding_available = True
         itos = self.config.token_meta.get('itos', {})
+        token_to_token_type_dict = self.config.token_meta.get('token_to_token_type_dict', {})
 
         # Categorize tokens
         self.special_tokens = set()
@@ -193,18 +194,36 @@ class GPT(nn.Module):
         self.float_tokens = set()
         self.operator_tokens = set()
 
-        for idx, token in itos.items():
-            if isinstance(token, str):
-                self.special_tokens.add(idx)
-            elif isinstance(token, tuple):
-                self.edge_tokens.add(idx)
-            elif isinstance(token, (int, float)):
-                # Distinguish operators from coefficients
-                # Operators are integers, coefficients are floats
-                if isinstance(token, int) and not isinstance(token, bool):
+        if len(token_to_token_type_dict) == 0:
+            for idx, token in itos.items():
+                if isinstance(token, str):
+                    self.special_tokens.add(idx)
+                elif isinstance(token, tuple):
+                    self.edge_tokens.add(idx)
+                elif isinstance(token, (int, float)):
+                    # Distinguish operators from coefficients
+                    # Operators are integers, coefficients are floats
+                    if isinstance(token, int) and not isinstance(token, bool):
+                        self.operator_tokens.add(idx)
+                    else:
+                        self.float_tokens.add(idx)
+        else:
+            # valid token types (from `prepare_circ.py`: SPECIAL, EDGE, NUM, OP)
+            for idx, token in itos.items():
+                token_type = token_to_token_type_dict[token]
+                if token_type == 'SPECIAL':
+                    self.special_tokens.add(idx)
+                elif token_type == 'EDGE':
+                    self.edge_tokens.add(idx)
+                elif token_type == 'NUM':
+                    self.float_tokens.add(idx)
+                elif token_type == 'OP':
                     self.operator_tokens.add(idx)
                 else:
-                    self.float_tokens.add(idx)
+                    raise ValueError(
+                        f"Unknown token type: {token_type}."
+                        "Most likely, this model is NOT compatible with the codebase version."
+                    )
 
         # Store specific special token indices
         stoi = self.config.token_meta.get('stoi', {})
