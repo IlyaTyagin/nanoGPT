@@ -217,6 +217,38 @@ class GPT(nn.Module):
         self.end_of_graph_token = stoi.get('end_of_graph')
         self.pad_token = stoi.get('pad', 0)
 
+        # Pre-calculate circuit position masks for fast lookup (GPU optimization)
+        # Circuit follows a 4-token repeating pattern: new_layer_p, operator, beta, gamma
+        vocab_size = self.config.vocab_size
+
+        # Position 0: After gamma coefficient → new_layer_p OR eos
+        circuit_mask_pos0 = torch.zeros(vocab_size, dtype=torch.bool)
+        circuit_mask_pos0[self.new_layer_token] = True
+        circuit_mask_pos0[self.eos_token] = True
+
+        # Position 1: After new_layer_p → operator tokens
+        circuit_mask_pos1 = torch.zeros(vocab_size, dtype=torch.bool)
+        for op_idx in self.operator_tokens:
+            circuit_mask_pos1[op_idx] = True
+
+        # Position 2: After operator → float tokens (beta coefficient)
+        circuit_mask_pos2 = torch.zeros(vocab_size, dtype=torch.bool)
+        for float_idx in self.float_tokens:
+            circuit_mask_pos2[float_idx] = True
+
+        # Position 3: After beta → float tokens (gamma coefficient)
+        circuit_mask_pos3 = torch.zeros(vocab_size, dtype=torch.bool)
+        for float_idx in self.float_tokens:
+            circuit_mask_pos3[float_idx] = True
+
+        # Stack into single tensor for fast indexed lookup: [4, vocab_size]
+        self.circuit_position_masks = torch.stack([
+            circuit_mask_pos0,
+            circuit_mask_pos1,
+            circuit_mask_pos2,
+            circuit_mask_pos3
+        ])
+
     def set_constrained_decoding(self, enabled):
         """
         Enable or disable constrained decoding at generation time.
@@ -386,6 +418,7 @@ class GPT(nn.Module):
     def get_allowed_token_mask(self, idx):
         """
         Create a mask for constrained decoding based on circuit grammar.
+        OPTIMIZED: Fully vectorized, no Python loops, no GPU-CPU transfers.
 
         Args:
             idx: Current token sequence (batch_size, seq_len)
@@ -398,96 +431,46 @@ class GPT(nn.Module):
             return torch.ones(idx.size(0), self.config.vocab_size, dtype=torch.bool, device=idx.device)
 
         batch_size = idx.size(0)
-        mask = torch.zeros(batch_size, self.config.vocab_size, dtype=torch.bool, device=idx.device)
+        device = idx.device
 
-        # Process each sequence in the batch
-        for b in range(batch_size):
-            seq = idx[b]
+        # Move pre-computed masks to same device as input (if needed)
+        if self.circuit_position_masks.device != device:
+            self.circuit_position_masks = self.circuit_position_masks.to(device)
 
-            # Find the last non-pad token
-            non_pad_mask = seq != self.pad_token
-            if non_pad_mask.any():
-                last_token_idx = non_pad_mask.nonzero(as_tuple=False)[-1].item()
-                last_token = seq[last_token_idx].item()
-            else:
-                # Empty sequence, should not happen but handle gracefully
-                last_token = self.bos_token
+        # Find end_of_graph positions for entire batch (vectorized)
+        # We only care about circuit tokens (after end_of_graph), graph tokens are guaranteed valid
+        eog_mask = (idx == self.end_of_graph_token)  # [batch_size, seq_len]
 
-            # Determine allowed tokens based on last token and grammar state
-            allowed_indices = self._get_allowed_tokens_for_state(seq, last_token)
+        # For each sequence, find the position of the LAST end_of_graph token
+        # Use a trick: multiply positions by the mask, then take max
+        positions = torch.arange(idx.size(1), device=device).unsqueeze(0)  # [1, seq_len]
+        eog_positions = (eog_mask.long() * positions).max(dim=1)[0]  # [batch_size]
 
-            # Set mask for allowed tokens
-            mask[b, allowed_indices] = True
+        # Check if each sequence has end_of_graph token
+        has_eog = eog_mask.any(dim=1)  # [batch_size]
+
+        # FULLY VECTORIZED: Calculate circuit sequence length for all samples in parallel
+        # Create a mask for tokens that are AFTER the end_of_graph position
+        # positions: [1, seq_len], eog_positions: [batch_size] → [batch_size, 1]
+        after_eog_mask = positions > eog_positions.unsqueeze(1)  # [batch_size, seq_len]
+
+        # Mask out pad tokens
+        non_pad_mask = (idx != self.pad_token)  # [batch_size, seq_len]
+
+        # Combine: tokens that are both after eog AND non-pad
+        circuit_token_mask = after_eog_mask & non_pad_mask  # [batch_size, seq_len]
+
+        # Count circuit tokens per sequence (vectorized sum)
+        circuit_lengths = circuit_token_mask.sum(dim=1)  # [batch_size]
+
+        # Calculate position within the 4-token layer pattern
+        # Position 0: new_layer_p or eos, Position 1: operator, Position 2: beta, Position 3: gamma
+        positions_in_layer = circuit_lengths % 4  # [batch_size]
+
+        # Lookup masks using positions as indices: [batch_size, vocab_size]
+        mask = self.circuit_position_masks[positions_in_layer]  # Vectorized lookup!
 
         return mask
-
-    def _get_allowed_tokens_for_state(self, seq, last_token):
-        """
-        Determine allowed tokens based on the last token and sequence state.
-
-        Grammar:
-        1. After 'bos': edge tuple OR 'end_of_graph'
-        2. After edge tuple: edge weight (float)
-        3. After edge weight: edge tuple OR 'end_of_graph'
-        4. After 'end_of_graph': 'new_layer_p' OR 'eos'
-        5. After 'new_layer_p': operator index (integer)
-        6. After operator index: beta coefficient (float)
-        7. After beta coefficient: gamma coefficient (float)
-        8. After gamma coefficient: 'new_layer_p' OR 'eos'
-        """
-
-        # Check if we're in graph section or circuit section
-        end_of_graph_positions = (seq == self.end_of_graph_token).nonzero(as_tuple=False)
-        in_circuit_section = len(end_of_graph_positions) > 0
-
-        if not in_circuit_section:
-            # Graph section
-            if last_token == self.bos_token:
-                # After bos: edge tuple OR end_of_graph
-                return list(self.edge_tokens) + [self.end_of_graph_token]
-            elif last_token in self.edge_tokens:
-                # After edge tuple: edge weight (float)
-                return list(self.float_tokens)
-            elif last_token in self.float_tokens:
-                # After edge weight: edge tuple OR end_of_graph
-                return list(self.edge_tokens) + [self.end_of_graph_token]
-            else:
-                # Fallback: allow edges and end_of_graph
-                return list(self.edge_tokens) + [self.end_of_graph_token]
-        else:
-            # Circuit section (after end_of_graph)
-            # Find position after last end_of_graph
-            last_eog_pos = end_of_graph_positions[-1].item()
-            circuit_seq = seq[last_eog_pos + 1:]
-
-            # Remove padding from circuit sequence
-            circuit_seq = circuit_seq[circuit_seq != self.pad_token]
-
-            # Determine position in 4-token layer structure
-            circuit_len = len(circuit_seq)
-
-            if circuit_len == 0 or last_token == self.end_of_graph_token:
-                # Right after end_of_graph or at layer boundary: new_layer_p OR eos
-                return [self.new_layer_token, self.eos_token]
-
-            # Calculate position within current layer (0: new_layer_p, 1: op, 2: beta, 3: gamma)
-            position_in_layer = circuit_len % 4
-
-            if position_in_layer == 1:
-                # After new_layer_p: operator index
-                return list(self.operator_tokens)
-            elif position_in_layer == 2:
-                # After operator: beta coefficient (float)
-                return list(self.float_tokens)
-            elif position_in_layer == 3:
-                # After beta: gamma coefficient (float)
-                return list(self.float_tokens)
-            elif position_in_layer == 0:
-                # After gamma: new_layer_p OR eos
-                return [self.new_layer_token, self.eos_token]
-            else:
-                # Fallback
-                return [self.new_layer_token, self.eos_token]
 
     @torch.no_grad()
     def generate(self, idx, graph_emb, max_new_tokens, temperature=1.0, top_k=None):
